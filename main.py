@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import platform
 import sqlite3
 from datetime import datetime, timedelta
 import time
@@ -12,7 +13,32 @@ import tty
 import termios
 import subprocess
 
+def check_file_accessibility(file_path):
+    """
+    Check if the file exists and is readable.
+    :param file_path: path to the file
+    :return: tuple (bool, str) indicating if file is accessible and a message
+    """
+    if not os.path.exists(file_path):
+        return False, f"File does not exist: {file_path}"
+    
+    if not os.access(file_path, os.R_OK):
+        return False, f"No read permission for file: {file_path}"
+    
+    return True, "File is accessible."
 
+def get_file_info(file_path):
+    """
+    Get file information using ls command.
+    :param file_path: path to the file
+    :return: string with file information
+    """
+    try:
+        result = subprocess.run(['ls', '-l', file_path], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return "Unable to get file information."
+    
 def create_connection(db_file):
     """
     create a database connection to the SQLite database specified by the db_file
@@ -23,8 +49,7 @@ def create_connection(db_file):
     try:
         conn = sqlite3.connect(db_file)
     except Error as e:
-        print(e)
-
+        print(f"Error connecting to database: {e}")
     return conn
 
 
@@ -42,8 +67,18 @@ def get_all_memos(conn):
 
 def main():
     # Define default paths
-    _db_path_default = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
+    # path depends on if the macOS version <=13 or >13
+    macos_version = float('.'.join(platform.mac_ver()[0].split('.')[:2]))
+    
+    if macos_version <= 13:
+        # ~/Library/Application\ Support/com.apple.voicememos/Recordings/CloudRecordings.db
+        _db_path_default = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
                                     "com.apple.voicememos", "Recordings", "CloudRecordings.db")
+    else:
+        # ~/Library/Group Containers/group.com.apple.VoiceMemos.shared/
+        _db_path_default = os.path.join(os.path.expanduser("~"), "Library", "Group Containers",
+                                    "group.com.apple.VoiceMemos.shared", "Recordings", "CloudRecordings.db")
+    
     _export_path_default = os.path.join(os.path.expanduser("~"), "Voice Memos Export")
 
     # Setting up arguments and --help
@@ -55,7 +90,7 @@ def main():
     parser.add_argument("-e", "--export_path", type=str,
                         help="define path to folder for exportation",
                         default=_export_path_default)
-    parser.add_argument("-a", "--all", action="store_true",
+    parser.add_argument("-a", "--all", action="store_true", default="--all",
                         help="export everything at once instead of step by step")
     parser.add_argument("--date_in_name", action="store_true",
                         help="include date in file name")
@@ -66,6 +101,26 @@ def main():
                         help="prevent to open finder window to show exported memos")
     args = parser.parse_args()
 
+    # Check permission and provide more detailed information
+    accessible, message = check_file_accessibility(args.db_path)
+    if not accessible:
+        print(f"Error: {message}")
+        print("\nFile details:")
+        print(get_file_info(args.db_path))
+        print("\nPossible solutions:")
+        print("1. Ensure your application has Full Disk Access:")
+        print("   Go to System Preferences -> Security & Privacy -> Privacy -> Full Disk Access")
+        print("   Add Terminal or your Python IDE to the list of allowed applications.")
+        print("2. If using an IDE, ensure the IDE has necessary permissions.")
+        print("3. Check if the file actually exists at the specified location.")
+        exit()
+
+    # create a database connection and load rows
+    conn = create_connection(args.db_path)
+    if not conn:
+        print("Failed to create database connection. Please check the database file and permissions.")
+        exit()
+        
     # Define name and width of columns
     _cols = [{"n": "Date",
              "w": 19},
@@ -148,13 +203,13 @@ def main():
         duration_str = str(timedelta(seconds=row[1]))
         duration_str = duration_str[:duration_str.rfind(".") + 3] if "." in duration_str else duration_str + ".00"
         duration_str = "0" + duration_str if len(duration_str) == 10 else duration_str
-        temp_label = '(unnamed)' if row[2] is None else row[2]
-        label = temp_label.encode(encoding = 'UTF-8', errors = 'ignore').decode("UTF-8").replace("/", "_")
+        # temp_label = '(unnamed)' if row[2] is None else row[2]
+        label = row[2].encode(encoding = 'UTF-8', errors = 'ignore').decode("UTF-8").replace("/", "_")
         path_old = row[3] if row[3] else ""
         if path_old:
             path_new = label + path_old[path_old.rfind("."):]
             path_new = date.strftime(args.date_in_name_format) + path_new if args.date_in_name else path_new
-            path_new = os.path.join(args.export_path, path_new)
+            path_new = os.path.join(args.export_path, path_old)
         else:
             path_new = ""
         if len(path_old) < getWidth("Old Path") - 3:
@@ -190,10 +245,20 @@ def main():
 
             # copy file and modify file times if this memo should be exported
             if key == 10:
-                copyfile(path_old, path_new)
-                mod_time = time.mktime(date.timetuple())
-                os.utime(path_new, (mod_time, mod_time))
-                print(body_row((date_str, duration_str, path_old_short, path_new_short, "Exported!")))
+                try:
+                    memo_path = os.path.join(os.path.dirname(args.db_path), path_old)
+                    copyfile(memo_path, path_new)
+                    mod_time = time.mktime(date.timetuple())
+                    os.utime(path_new, (mod_time, mod_time))
+                    print(body_row((date_str, duration_str, path_old_short, path_new_short, "Exported!")))
+                except FileNotFoundError:
+                    print(f"Error: Source file not found - {path_old}")
+                    print(f"File details: {get_file_info(path_old)}")
+                except PermissionError:
+                    print(f"Error: Permission denied when copying file - {path_old}")
+                    print(f"File details: {get_file_info(path_old)}")
+                except Exception as e:
+                    print(f"Error occurred while copying file: {e}")
 
             # skip this memo if desired
             elif key == 27:
